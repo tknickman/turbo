@@ -3,15 +3,9 @@
   - any: ["examples/*", "examples/**/*"]
 
 "area: turborepo":
-  - any:
-      [
-        "cli/*",
-        "cli/**/*",
-        "crates/turborepo/*",
-        "crates/turborepo/**/*",
-        "crates/turborepo-lib/*",
-        "crates/turborepo-lib/**/*",
-      ]
+  - any: ["cli/*", "cli/**/*"]
+  - any: ["crates/turborepo/*", "crates/turborepo/**/*"]
+  - any: ["crates/turborepo-lib/*", "crates/turborepo-lib/**/*"]
 
 "area: turbopack":
   - any:
