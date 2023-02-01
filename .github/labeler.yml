@@ -1,23 +1,38 @@
 # areas
 "area: examples":
-  - "examples/*"
-  - "examples/**/*"
+  - any: [
+      "examples/*",
+      "examples/**/*"
+    ]
 
 "area: turborepo":
-  - "cli/*"
-  - "crates/turborepo/*"
-  - "crates/turborepo-lib/*"
+  - any: [
+      "cli/*",
+      "cli/**/*",
+      "crates/turborepo/*",
+      "crates/turborepo/**/*",
+      "crates/turborepo-lib/*",
+      "crates/turborepo-lib/**/*",
+    ]
 
 "area: turbopack":
-  - any: ['crates/**/*', '!crates/turborepo/*', '!crates/turborepo-lib/*']
+  - any: [
+      "crates/**/*",
+      "!crates/turborepo/*",
+      "!crates/turborepo/**/*",
+      "!crates/turborepo-lib/*",
+      "!crates/turborepo-lib/**/*",
+    ]
 
 "area: site":
   - any: ["docs/*"]
   - all: ["docs/**/*", "!docs/**/*.mdx"]
 
 "area: ci":
-  - .github/*
-  - .github/**/*
+  - any: [
+      .github/*,
+      .github/**/*
+    ],
 
 "area: docs":
   - any: ["docs/*"]
@@ -37,3 +52,7 @@
 "pkg: turbo-ignore":
   - "packages/turbo-ignore/*"
   - "packages/turbo-ignore/**/*"
+
+"pkg: turbo-codemod":
+  - "packages/turbo-codemod/*"
+  - "packages/turbo-codemod/**/*"
