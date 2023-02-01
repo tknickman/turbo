@@ -6,7 +6,7 @@
 "area: turborepo":
   - "cli/*"
   - "crates/turborepo/*"
-  - "crates/turborepo-lib/**"
+  - "crates/turborepo-lib/*"
 
 "area: turbopack":
   - any: ['crates/**/*', '!crates/turborepo/*', '!crates/turborepo-lib/*']
