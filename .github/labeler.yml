@@ -1,21 +1,22 @@
 # areas
 "area: examples":
-  - any: ["examples/*", "examples/**/*"]
+  - "examples/*"
+  - "examples/**/*"
 
 "area: turborepo":
-  - any: ["cli/*"]
-  - any: ["crates/turborepo/*"]
-  - any: ["crates/turborepo-lib/*"]
+  - cli/*
+  - cli/**/*
+  - crates/turborepo/*
+  - crates/turborepo/**/*
+  - crates/turborepo-lib/*
+  - crates/turborepo-lib/**/*
 
 "area: turbopack":
-  - any:
-      [
-        "crates/**/*",
-        "!crates/turborepo/*",
-        "!crates/turborepo/**/*",
-        "!crates/turborepo-lib/*",
-        "!crates/turborepo-lib/**/*",
-      ]
+  - crates/**/*
+  - "!crates/turborepo/*"
+  - "!crates/turborepo/**/*"
+  - "!crates/turborepo-lib/*"
+  - "!crates/turborepo-lib/**/*"
 
 "area: site":
   - any: ["docs/*"]
