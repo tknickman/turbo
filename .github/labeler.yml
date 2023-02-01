@@ -1,38 +1,34 @@
 # areas
 "area: examples":
-  - any: [
-      "examples/*",
-      "examples/**/*"
-    ]
+  - any: ["examples/*", "examples/**/*"]
 
 "area: turborepo":
-  - any: [
-      "cli/*",
-      "cli/**/*",
-      "crates/turborepo/*",
-      "crates/turborepo/**/*",
-      "crates/turborepo-lib/*",
-      "crates/turborepo-lib/**/*",
-    ]
+  - any:
+      [
+        "cli/*",
+        "cli/**/*",
+        "crates/turborepo/*",
+        "crates/turborepo/**/*",
+        "crates/turborepo-lib/*",
+        "crates/turborepo-lib/**/*",
+      ]
 
 "area: turbopack":
-  - any: [
-      "crates/**/*",
-      "!crates/turborepo/*",
-      "!crates/turborepo/**/*",
-      "!crates/turborepo-lib/*",
-      "!crates/turborepo-lib/**/*",
-    ]
+  - any:
+      [
+        "crates/**/*",
+        "!crates/turborepo/*",
+        "!crates/turborepo/**/*",
+        "!crates/turborepo-lib/*",
+        "!crates/turborepo-lib/**/*",
+      ]
 
 "area: site":
   - any: ["docs/*"]
   - all: ["docs/**/*", "!docs/**/*.mdx"]
 
 "area: ci":
-  - any: [
-      .github/*,
-      .github/**/*
-    ],
+  - any: [".github/*", ".github/**/*"]
 
 "area: docs":
   - any: ["docs/*"]
