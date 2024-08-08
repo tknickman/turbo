@@ -10,23 +10,24 @@ use std::{
 #[cfg(not(test))]
 use console::Style;
 use console::StyledObject;
+use dialoguer::Confirm;
 #[cfg(not(test))]
 use dialoguer::FuzzySelect;
-use dialoguer::{theme::ColorfulTheme, Confirm};
 use dirs_next::home_dir;
 #[cfg(test)]
 use rand::Rng;
 use thiserror::Error;
-use turborepo_api_client::Client;
+use turborepo_api_client::{CacheClient, Client};
 #[cfg(not(test))]
 use turborepo_ui::CYAN;
-use turborepo_ui::{BOLD, GREY, UNDERLINE};
+use turborepo_ui::{DialoguerTheme, BOLD, GREY};
 use turborepo_vercel_api::{CachingStatus, Space, Team};
 
 use crate::{
     cli::LinkTarget,
     commands::CommandBase,
     config,
+    gitignore::ensure_turbo_is_gitignored,
     rewrite_json::{self, set_path, unset_path},
 };
 
@@ -88,11 +89,9 @@ pub(crate) enum SelectedSpace<'a> {
     Space(&'a Space),
 }
 
-pub(crate) const REMOTE_CACHING_INFO: &str = "  Remote Caching shares your cached Turborepo task \
-                                              outputs and logs across
-  all your team’s Vercel projects. It also can share outputs
-  with other services that enable Remote Caching, like CI/CD systems.
-  This results in faster build times and deployments for your team.";
+pub(crate) const REMOTE_CACHING_INFO: &str =
+    "Remote Caching makes your caching multiplayer,\nsharing build outputs and logs between \
+     developers and CI/CD systems.\n\nBuild and deploy faster.";
 pub(crate) const REMOTE_CACHING_URL: &str =
     "https://turbo.build/repo/docs/core-concepts/remote-caching";
 pub(crate) const SPACES_URL: &str = "https://vercel.com/docs/workflow-collaboration/vercel-spaces";
@@ -108,7 +107,7 @@ pub(crate) const SPACES_URL: &str = "https://vercel.com/docs/workflow-collaborat
 ///
 /// returns: Result<(), Error>
 pub(crate) async fn verify_caching_enabled<'a>(
-    api_client: &impl Client,
+    api_client: &(impl Client + CacheClient),
     team_id: &str,
     token: &str,
     selected_team: Option<SelectedTeam<'a>>,
@@ -178,13 +177,10 @@ pub async fn link(
     match target {
         LinkTarget::RemoteCache => {
             println!(
-                ">>> Remote Caching
-
-    {}
-      For more info, see {}
-      ",
+                "\n{}\n\n{}\n\nFor more information, visit: {}\n",
+                base.ui.rainbow(">>> Remote Caching"),
                 REMOTE_CACHING_INFO,
-                base.ui.apply(UNDERLINE.apply_to(REMOTE_CACHING_URL))
+                REMOTE_CACHING_URL
             );
 
             if !should_link_remote_cache(base, &repo_root_with_tilde)? {
@@ -207,7 +203,7 @@ pub async fn link(
                 .await
                 .map_err(Error::TeamsRequest)?;
 
-            let selected_team = select_team(base, &teams_response.teams, user_display_name)?;
+            let selected_team = select_team(base, &teams_response.teams)?;
 
             let team_id = match selected_team {
                 SelectedTeam::User => user_response.user.id.as_str(),
@@ -254,9 +250,11 @@ pub async fn link(
             };
 
             if modify_gitignore {
-                add_turbo_to_gitignore(base).map_err(|error| config::Error::FailedToSetConfig {
-                    config_path: base.repo_root.join_component(".gitignore"),
-                    error,
+                ensure_turbo_is_gitignored(&base.repo_root).map_err(|error| {
+                    config::Error::FailedToSetConfig {
+                        config_path: base.repo_root.join_component(".gitignore"),
+                        error,
+                    }
                 })?;
             }
 
@@ -278,7 +276,7 @@ pub async fn link(
 
       For more info, see {}
       ",
-                base.ui.apply(UNDERLINE.apply_to(SPACES_URL))
+                SPACES_URL
             );
 
             if !should_link_spaces(base, &repo_root_with_tilde)? {
@@ -290,18 +288,12 @@ pub async fn link(
                 .await
                 .map_err(Error::UserNotFound)?;
 
-            let user_display_name = user_response
-                .user
-                .name
-                .as_deref()
-                .unwrap_or(user_response.user.username.as_str());
-
             let teams_response = api_client
                 .get_teams(token)
                 .await
                 .map_err(Error::TeamsRequest)?;
 
-            let selected_team = select_team(base, &teams_response.teams, user_display_name)?;
+            let selected_team = select_team(base, &teams_response.teams)?;
 
             let team_id = match selected_team {
                 SelectedTeam::User => user_response.user.id.as_str(),
@@ -371,7 +363,7 @@ pub async fn link(
 }
 
 fn should_enable_caching() -> Result<bool, Error> {
-    let theme = ColorfulTheme::default();
+    let theme = DialoguerTheme::default();
 
     Confirm::with_theme(&theme)
         .with_prompt(
@@ -384,35 +376,25 @@ fn should_enable_caching() -> Result<bool, Error> {
 }
 
 #[cfg(test)]
-fn select_team<'a>(
-    _: &CommandBase,
-    teams: &'a [Team],
-    _: &'a str,
-) -> Result<SelectedTeam<'a>, Error> {
+fn select_team<'a>(_: &CommandBase, teams: &'a [Team]) -> Result<SelectedTeam<'a>, Error> {
     let mut rng = rand::thread_rng();
-    let idx = rng.gen_range(0..=(teams.len()));
-    if idx == teams.len() {
-        Ok(SelectedTeam::User)
-    } else {
-        Ok(SelectedTeam::Team(&teams[idx]))
-    }
+    let idx = rng.gen_range(0..(teams.len()));
+    Ok(SelectedTeam::Team(&teams[idx]))
 }
 
 #[cfg(not(test))]
-fn select_team<'a>(
-    base: &CommandBase,
-    teams: &'a [Team],
-    user_display_name: &'a str,
-) -> Result<SelectedTeam<'a>, Error> {
-    let mut team_names = vec![user_display_name];
-    team_names.extend(teams.iter().map(|team| team.name.as_str()));
+fn select_team<'a>(base: &CommandBase, teams: &'a [Team]) -> Result<SelectedTeam<'a>, Error> {
+    let team_names = teams
+        .iter()
+        .map(|team| team.name.as_str())
+        .collect::<Vec<_>>();
 
-    let theme = ColorfulTheme {
+    let theme = DialoguerTheme {
         active_item_style: Style::new().cyan().bold(),
         active_item_prefix: Style::new().cyan().bold().apply_to(">".to_string()),
         prompt_prefix: Style::new().dim().bold().apply_to("?".to_string()),
         values_style: Style::new().cyan(),
-        ..ColorfulTheme::default()
+        ..DialoguerTheme::default()
     };
 
     let prompt = format!(
@@ -431,11 +413,7 @@ fn select_team<'a>(
         .interact()
         .map_err(Error::UserCanceled)?;
 
-    if selection == 0 {
-        Ok(SelectedTeam::User)
-    } else {
-        Ok(SelectedTeam::Team(&teams[selection - 1]))
-    }
+    Ok(SelectedTeam::Team(&teams[selection]))
 }
 
 #[cfg(test)]
@@ -452,12 +430,12 @@ fn select_space<'a>(base: &CommandBase, spaces: &'a [Space]) -> Result<SelectedS
         .map(|space| space.name.as_str())
         .collect::<Vec<_>>();
 
-    let theme = ColorfulTheme {
+    let theme = DialoguerTheme {
         active_item_style: Style::new().cyan().bold(),
         active_item_prefix: Style::new().cyan().bold().apply_to(">".to_string()),
         prompt_prefix: Style::new().dim().bold().apply_to("?".to_string()),
         values_style: Style::new().cyan(),
-        ..ColorfulTheme::default()
+        ..DialoguerTheme::default()
     };
 
     let prompt = format!(
@@ -487,11 +465,12 @@ fn should_link_remote_cache(_: &CommandBase, _: &str) -> Result<bool, Error> {
 #[cfg(not(test))]
 fn should_link_remote_cache(base: &CommandBase, location: &str) -> Result<bool, Error> {
     let prompt = format!(
-        "{}{} {}",
+        "{}{} {}{}",
         base.ui.apply(BOLD.apply_to(GREY.apply_to("? "))),
         base.ui
-            .apply(BOLD.apply_to("Would you like to enable Remote Caching for")),
-        base.ui.apply(BOLD.apply_to(CYAN.apply_to(location)))
+            .apply(BOLD.apply_to("Enable Vercel Remote Cache for")),
+        base.ui.apply(BOLD.apply_to(CYAN.apply_to(location))),
+        base.ui.apply(BOLD.apply_to(" ?"))
     );
 
     Confirm::new()
@@ -586,7 +565,7 @@ mod test {
 
     use anyhow::Result;
     use tempfile::{NamedTempFile, TempDir};
-    use turbopath::AbsoluteSystemPathBuf;
+    use turbopath::{AbsoluteSystemPathBuf, AnchoredSystemPath};
     use turborepo_ui::UI;
     use turborepo_vercel_api_mock::start_test_server;
 
@@ -717,7 +696,7 @@ mod test {
 
         fs::write(
             turbo_json_file.as_path(),
-            r#"{ "globalEnv": [], "pipeline": {} }"#,
+            r#"{ "globalEnv": [], "tasks": {} }"#,
         )
         .unwrap();
 
@@ -729,8 +708,11 @@ mod test {
 
         // verify space id is added to turbo.json
         let turbo_json_contents = fs::read_to_string(&turbo_json_file).unwrap();
-        let turbo_json =
-            RawTurboJson::parse(&turbo_json_contents, turbo_json_file.as_str()).unwrap();
+        let turbo_json = RawTurboJson::parse(
+            &turbo_json_contents,
+            AnchoredSystemPath::new("turbo.json").unwrap(),
+        )
+        .unwrap();
         assert_eq!(
             turbo_json.experimental_spaces.unwrap().id.unwrap(),
             turborepo_vercel_api_mock::EXPECTED_SPACE_ID.into()

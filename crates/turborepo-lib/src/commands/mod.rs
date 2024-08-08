@@ -1,29 +1,33 @@
-use std::cell::OnceCell;
+use std::{cell::OnceCell, time::Duration};
 
-use dirs_next::config_dir;
-use sha2::{Digest, Sha256};
 use turbopath::{AbsoluteSystemPath, AbsoluteSystemPathBuf};
 use turborepo_api_client::{APIAuth, APIClient};
+use turborepo_auth::{TURBO_TOKEN_DIR, TURBO_TOKEN_FILE};
+use turborepo_dirs::config_dir;
 use turborepo_ui::UI;
 
 use crate::{
+    cli::Command,
     config::{ConfigurationOptions, Error as ConfigError, TurborepoConfigBuilder},
+    turbo_json::UIMode,
     Args,
 };
 
 pub(crate) mod bin;
+pub(crate) mod config;
 pub(crate) mod daemon;
 pub(crate) mod generate;
-pub(crate) mod info;
 pub(crate) mod link;
 pub(crate) mod login;
 pub(crate) mod logout;
+pub(crate) mod ls;
 pub(crate) mod prune;
 pub(crate) mod run;
+pub(crate) mod scan;
 pub(crate) mod telemetry;
 pub(crate) mod unlink;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CommandBase {
     pub repo_root: AbsoluteSystemPathBuf,
     pub ui: UI,
@@ -66,6 +70,39 @@ impl CommandBase {
             .with_team_slug(self.args.team.clone())
             .with_token(self.args.token.clone())
             .with_timeout(self.args.remote_cache_timeout)
+            .with_preflight(self.args.preflight.then_some(true))
+            .with_ui(self.args.ui.or_else(|| {
+                self.args.execution_args.as_ref().and_then(|args| {
+                    if !args.log_order.compatible_with_tui() {
+                        Some(UIMode::Stream)
+                    } else {
+                        // If the argument is compatible with the TUI this does not mean we should
+                        // override other configs
+                        None
+                    }
+                })
+            }))
+            .with_allow_no_package_manager(
+                self.args
+                    .dangerously_disable_package_manager_check
+                    .then_some(true),
+            )
+            .with_daemon(self.args.run_args.as_ref().and_then(|args| args.daemon()))
+            .with_env_mode(
+                self.args
+                    .command
+                    .as_ref()
+                    .and_then(|c| match c {
+                        Command::Run { execution_args, .. } => execution_args.env_mode,
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        self.args
+                            .execution_args
+                            .as_ref()
+                            .and_then(|args| args.env_mode)
+                    }),
+            )
             .build()
     }
 
@@ -80,9 +117,9 @@ impl CommandBase {
             return Ok(global_config_path);
         }
 
-        let config_dir = config_dir().ok_or(ConfigError::NoGlobalConfigPath)?;
-        let global_config_path = config_dir.join("turborepo").join("config.json");
-        AbsoluteSystemPathBuf::try_from(global_config_path).map_err(ConfigError::PathError)
+        let config_dir = config_dir()?.ok_or(ConfigError::NoGlobalConfigPath)?;
+
+        Ok(config_dir.join_components(&[TURBO_TOKEN_DIR, TURBO_TOKEN_FILE]))
     }
     fn local_config_path(&self) -> AbsoluteSystemPathBuf {
         self.repo_root.join_components(&[".turbo", "config.json"])
@@ -114,15 +151,32 @@ impl CommandBase {
         &self.args
     }
 
+    pub fn args_mut(&mut self) -> &mut Args {
+        &mut self.args
+    }
+
     pub fn api_client(&self) -> Result<APIClient, ConfigError> {
         let config = self.config()?;
-        let args = self.args();
-
         let api_url = config.api_url();
         let timeout = config.timeout();
+        let upload_timeout = config.upload_timeout();
 
-        APIClient::new(api_url, timeout, self.version, args.preflight)
-            .map_err(ConfigError::ApiClient)
+        APIClient::new(
+            api_url,
+            if timeout > 0 {
+                Some(Duration::from_secs(timeout))
+            } else {
+                None
+            },
+            if upload_timeout > 0 {
+                Some(Duration::from_secs(upload_timeout))
+            } else {
+                None
+            },
+            self.version,
+            config.preflight(),
+        )
+        .map_err(ConfigError::ApiClient)
     }
 
     /// Current working directory for the turbo command
@@ -134,89 +188,7 @@ impl CommandBase {
         &self.repo_root
     }
 
-    pub fn daemon_file_root(&self) -> AbsoluteSystemPathBuf {
-        DaemonRootHasher(&self.repo_root).daemon_file_root()
-    }
-
-    fn repo_hash(&self) -> String {
-        DaemonRootHasher(&self.repo_root).repo_hash()
-    }
-
     pub fn version(&self) -> &'static str {
         self.version
-    }
-}
-
-pub struct DaemonRootHasher<'a>(&'a AbsoluteSystemPath);
-
-impl<'a> DaemonRootHasher<'a> {
-    pub fn new(repo_root: &'a AbsoluteSystemPath) -> Self {
-        Self(repo_root)
-    }
-
-    pub fn daemon_file_root(&self) -> AbsoluteSystemPathBuf {
-        AbsoluteSystemPathBuf::new(std::env::temp_dir().to_str().expect("UTF-8 path"))
-            .expect("temp dir is valid")
-            .join_component("turbod")
-            .join_component(self.repo_hash().as_str())
-    }
-
-    pub fn sock_path(&self) -> AbsoluteSystemPathBuf {
-        self.daemon_file_root().join_component("turbod.sock")
-    }
-
-    pub fn lock_path(&self) -> AbsoluteSystemPathBuf {
-        self.daemon_file_root().join_component("turbod.pid")
-    }
-
-    pub fn lsp_path(&self) -> AbsoluteSystemPathBuf {
-        self.daemon_file_root().join_component("lsp.pid")
-    }
-
-    fn repo_hash(&self) -> String {
-        let mut hasher = Sha256::new();
-        hasher.update(self.0.as_bytes());
-        hex::encode(&hasher.finalize()[..8])
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use test_case::test_case;
-    use turbopath::AbsoluteSystemPathBuf;
-    use turborepo_ui::UI;
-
-    use crate::get_version;
-
-    #[cfg(not(target_os = "windows"))]
-    #[test_case("/tmp/turborepo", "6e0cfa616f75a61c"; "basic example")]
-    fn test_repo_hash(path: &str, expected_hash: &str) {
-        use super::CommandBase;
-        use crate::Args;
-
-        let args = Args::default();
-        let repo_root = AbsoluteSystemPathBuf::new(path).unwrap();
-        let command_base = CommandBase::new(args, repo_root, get_version(), UI::new(true));
-
-        let hash = command_base.repo_hash();
-
-        assert_eq!(hash, expected_hash);
-        assert_eq!(hash.len(), 16);
-    }
-
-    #[cfg(target_os = "windows")]
-    #[test_case("C:\\\\tmp\\turborepo", "0103736e6883e35f"; "basic example")]
-    fn test_repo_hash_win(path: &str, expected_hash: &str) {
-        use super::CommandBase;
-        use crate::Args;
-
-        let args = Args::default();
-        let repo_root = AbsoluteSystemPathBuf::new(path).unwrap();
-        let command_base = CommandBase::new(args, repo_root, get_version(), UI::new(true));
-
-        let hash = command_base.repo_hash();
-
-        assert_eq!(hash, expected_hash);
-        assert_eq!(hash.len(), 16);
     }
 }

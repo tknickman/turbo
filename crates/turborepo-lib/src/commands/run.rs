@@ -1,39 +1,66 @@
-use tracing::{debug, error};
+use std::future::Future;
+
+use tracing::error;
 use turborepo_telemetry::events::command::CommandEventBuilder;
 
-use crate::{commands::CommandBase, run, run::Run, signal::SignalHandler};
+use crate::{commands::CommandBase, run, run::builder::RunBuilder, signal::SignalHandler};
 
-pub async fn run(base: CommandBase, telemetry: CommandEventBuilder) -> Result<i32, run::Error> {
-    #[cfg(windows)]
-    let signal = {
-        let mut ctrl_c = tokio::signal::windows::ctrl_c().map_err(run::Error::SignalHandler)?;
-        async move { ctrl_c.recv().await }
-    };
-    #[cfg(not(windows))]
-    let signal = {
-        use tokio::signal::unix;
-        let mut sigint =
-            unix::signal(unix::SignalKind::interrupt()).map_err(run::Error::SignalHandler)?;
-        let mut sigterm =
-            unix::signal(unix::SignalKind::terminate()).map_err(run::Error::SignalHandler)?;
-        async move {
-            tokio::select! {
-                res = sigint.recv() => {
-                    res
-                }
-                res = sigterm.recv() => {
-                    res
-                }
+#[cfg(windows)]
+pub fn get_signal() -> Result<impl Future<Output = Option<()>>, run::Error> {
+    let mut ctrl_c = tokio::signal::windows::ctrl_c().map_err(run::Error::SignalHandler)?;
+    Ok(async move { ctrl_c.recv().await })
+}
+
+#[cfg(not(windows))]
+pub fn get_signal() -> Result<impl Future<Output = Option<()>>, run::Error> {
+    use tokio::signal::unix;
+    let mut sigint =
+        unix::signal(unix::SignalKind::interrupt()).map_err(run::Error::SignalHandler)?;
+    let mut sigterm =
+        unix::signal(unix::SignalKind::terminate()).map_err(run::Error::SignalHandler)?;
+
+    Ok(async move {
+        tokio::select! {
+            res = sigint.recv() => {
+                res
+            }
+            res = sigterm.recv() => {
+                res
             }
         }
-    };
+    })
+}
 
+pub async fn run(base: CommandBase, telemetry: CommandEventBuilder) -> Result<i32, run::Error> {
+    let signal = get_signal()?;
     let handler = SignalHandler::new(signal);
 
-    let mut run = Run::new(&base);
-    debug!("using the experimental rust codepath");
-    debug!("configured run struct: {:?}", run);
-    let run_fut = run.run(&handler, telemetry);
+    let run_builder = RunBuilder::new(base)?;
+
+    let run_fut = async {
+        let (analytics_sender, analytics_handle) = run_builder.start_analytics();
+        let mut run = run_builder
+            .with_analytics_sender(analytics_sender)
+            .build(&handler, telemetry)
+            .await?;
+
+        let (sender, handle) = run.start_experimental_ui()?.unzip();
+        let result = run.run(sender.clone(), false).await;
+
+        if let Some(analytics_handle) = analytics_handle {
+            analytics_handle.close_with_timeout().await;
+        }
+
+        if let (Some(handle), Some(sender)) = (handle, sender) {
+            sender.stop();
+            if let Err(e) = handle.await.expect("render thread panicked") {
+                error!("error encountered rendering tui: {e}");
+            }
+        }
+
+        result
+    };
+
     let handler_fut = handler.done();
     tokio::select! {
         biased;
@@ -46,18 +73,7 @@ pub async fn run(base: CommandBase, telemetry: CommandEventBuilder) -> Result<i3
         result = run_fut => {
             // Run finished so close the signal handler
             handler.close().await;
-            match result {
-                Ok(code) => {
-                    if code != 0 {
-                        error!("run failed: command  exited ({code})")
-                    }
-                    Ok(code)
-                },
-                Err(err) => {
-                    error!("run failed: {}", err);
-                    Err(err)
-                }
-            }
+            result
         },
     }
 }

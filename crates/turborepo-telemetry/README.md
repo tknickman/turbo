@@ -1,8 +1,8 @@
 # turborepo-telemetry
 
-<!-- TODO: [telemetry] remove this disclaimer once live -->
-
-> ## :warning: **This feature is NOT enabled, It can only be activated by manually setting `TURBO_TELEMETRY_ENABLED=1`**
+**NOTE**:
+This crate has been ported to the [turbo-telemetry](https://github.com/vercel/turborepo/blob/main/crates/turborepo-telemetry) node package.
+Any changes made here should also be made to that package as well.
 
 ## Overview
 

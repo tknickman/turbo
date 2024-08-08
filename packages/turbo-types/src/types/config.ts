@@ -1,6 +1,11 @@
 /* This file generates the `schema.json` file. */
 export type Schema = RootSchema | WorkspaceSchema;
 
+/* Used to support codemods that target turbo 1 */
+export type LegacySchema = LegacyRootSchema | LegacyWorkspaceSchema;
+
+export type SchemaV1 = RootSchemaV1 | WorkspaceSchemaV1;
+
 export interface BaseSchema {
   /** @defaultValue https://turbo.build/schema.json */
   $schema?: string;
@@ -9,12 +14,12 @@ export interface BaseSchema {
    * these conventions to schedule, execute, and cache the outputs of tasks in
    * your project.
    *
-   * Documentation: https://turbo.build/repo/docs/reference/configuration#pipeline
+   * Documentation: https://turbo.build/repo/docs/reference/configuration#tasks
    *
    * @defaultValue `{}`
    */
   // eslint-disable-next-line @typescript-eslint/consistent-indexed-object-style -- it's more readable to specify a name for the key
-  pipeline: {
+  tasks: {
     /**
      * The name of a task that can be executed by turbo. If turbo finds a workspace
      * package with a package.json scripts object with a matching key, it will apply the
@@ -23,6 +28,15 @@ export interface BaseSchema {
     [script: string]: Pipeline;
   };
 }
+
+export interface BaseSchemaV1 {
+  // eslint-disable-next-line @typescript-eslint/consistent-indexed-object-style -- it's more readable to specify a name for the key
+  pipeline: {
+    [script: string]: Pipeline;
+  };
+}
+
+export type LegacyBaseSchema = BaseSchema | BaseSchemaV1;
 
 export interface WorkspaceSchema extends BaseSchema {
   /**
@@ -39,6 +53,14 @@ export interface WorkspaceSchema extends BaseSchema {
    */
   extends: Array<string>;
 }
+
+export type LegacyWorkspaceSchema = WorkspaceSchema & LegacyBaseSchema;
+
+export type WorkspaceSchemaV1 = Omit<
+  WorkspaceSchema,
+  "tasks" | "dangerouslyDisablePackageManagerCheck"
+> &
+  BaseSchemaV1;
 
 export interface RootSchema extends BaseSchema {
   /**
@@ -76,18 +98,7 @@ export interface RootSchema extends BaseSchema {
    * An allowlist of environment variables that should be made to all tasks, but
    * should not contribute to the task's cache key, e.g. `AWS_SECRET_KEY`.
    *
-   * Documentation: https://turbo.build/repo/docs/reference/configuration#globalPassThroughEnv
-   *
-   * @defaultValue null
-   * @deprecated use `globalPassThroughEnv` instead
-   */
-  experimentalGlobalPassThroughEnv?: null | Array<string>;
-
-  /**
-   * An allowlist of environment variables that should be made to all tasks, but
-   * should not contribute to the task's cache key, e.g. `AWS_SECRET_KEY`.
-   *
-   * Documentation: https://turbo.build/repo/docs/reference/configuration#globalPassThroughEnv
+   * Documentation: https://turbo.build/repo/docs/reference/configuration#globalpassthroughenv
    *
    * @defaultValue null
    */
@@ -111,7 +122,30 @@ export interface RootSchema extends BaseSchema {
    * @defaultValue `{}`
    */
   remoteCache?: RemoteCache;
+
+  /**
+   * Enable use of the UI for `turbo`.
+   *
+   * Documentation: https://turbo.build/repo/docs/reference/configuration#ui
+   *
+   * @defaultValue `"stream"`
+   */
+  ui?: UI;
+
+  /**
+   * Disable check for `packageManager` in root `package.json`
+   *
+   * This is highly discouraged as it leaves `turbo` dependent on system
+   * configuration to infer the correct package manager.
+   *
+   * Some turbo features are disabled if this is set to true.
+   */
+  dangerouslyDisablePackageManagerCheck?: boolean;
 }
+
+export type LegacyRootSchema = RootSchema & LegacyBaseSchema;
+
+export type RootSchemaV1 = Omit<RootSchema, "tasks"> & BaseSchemaV1;
 
 export interface Pipeline {
   /**
@@ -151,19 +185,7 @@ export interface Pipeline {
    * task's environment, but should not contribute to the task's cache key,
    * e.g. `AWS_SECRET_KEY`.
    *
-   * Documentation: https://turbo.build/repo/docs/reference/configuration#passThroughEnv
-   *
-   * @defaultValue null
-   * @deprecated use `passThroughEnv` instead
-   */
-  experimentalPassThroughEnv?: null | Array<string>;
-
-  /**
-   * An allowlist of environment variables that should be made available in this
-   * task's environment, but should not contribute to the task's cache key,
-   * e.g. `AWS_SECRET_KEY`.
-   *
-   * Documentation: https://turbo.build/repo/docs/reference/configuration#passThroughEnv
+   * Documentation: https://turbo.build/repo/docs/reference/configuration#passthroughenv
    *
    * @defaultValue null
    */
@@ -233,11 +255,11 @@ export interface Pipeline {
    *
    * "none": Hides all task output
    *
-   * Documentation: https://turbo.build/repo/docs/reference/command-line-reference#--output-logs
+   * Documentation: https://turbo.build/repo/docs/reference/run#--output-logs-option
    *
    * @defaultValue full
    */
-  outputMode?: OutputMode;
+  outputLogs?: OutputMode;
 
   /**
    * Indicates whether the task exits or not. Setting `persistent` to `true` tells
@@ -249,6 +271,15 @@ export interface Pipeline {
    * @defaultValue false
    */
   persistent?: boolean;
+
+  /**
+   * Mark a task as interactive allowing it to receive input from stdin.
+   * Interactive tasks must be marked with "cache": false as the input
+   * they receive from stdin can change the outcome of the task.
+   *
+   * Documentation: https://turbo.build/repo/docs/reference/configuration#interactive
+   */
+  interactive?: boolean;
 }
 
 export interface RemoteCache {
@@ -279,6 +310,8 @@ export type OutputMode =
   | "new-only"
   | "errors-only"
   | "none";
+
+export type UI = "tui" | "stream";
 
 export type AnchoredUnixPath = string;
 export type EnvWildcard = string;

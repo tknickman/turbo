@@ -1,11 +1,12 @@
 import path from "node:path";
 import childProcess from "node:child_process";
-import chalk from "chalk";
+import { bold, cyan, green, red } from "picocolors";
 import { setupTestFixtures, spyConsole, spyExit } from "@turbo/test-utils";
 import { logger } from "@turbo/utils";
 import type { PackageManager } from "@turbo/utils";
 // imports for mocks
 import * as turboWorkspaces from "@turbo/workspaces";
+import { CreateTurboTelemetry, TelemetryConfig } from "@turbo/telemetry";
 import * as turboUtils from "@turbo/utils";
 import type { CreateCommandArgument } from "../src/commands/create/types";
 import { create } from "../src/commands/create";
@@ -24,6 +25,21 @@ describe("create-turbo", () => {
 
   const mockConsole = spyConsole();
   const mockExit = spyExit();
+  const telemetry = new CreateTurboTelemetry({
+    api: "https://example.com",
+    packageInfo: {
+      name: "create-turbo",
+      version: "1.0.0",
+    },
+    config: new TelemetryConfig({
+      configPath: "test-config-path",
+      config: {
+        telemetry_enabled: false,
+        telemetry_id: "telemetry-test-id",
+        telemetry_salt: "telemetry-salt",
+      },
+    }),
+  });
 
   test.each<{ packageManager: PackageManager }>([
     { packageManager: "yarn" },
@@ -69,29 +85,37 @@ describe("create-turbo", () => {
           return "success";
         });
 
-      await create(
-        root as CreateCommandArgument,
-        packageManager as CreateCommandArgument,
-        {
-          skipInstall: true,
-          example: "default",
-        }
-      );
+      await create(root as CreateCommandArgument, {
+        packageManager,
+        skipInstall: true,
+        example: "default",
+        telemetry,
+      });
 
-      const expected = `${chalk.bold(
+      const expected = `${bold(
         logger.turboGradient(">>> Success!")
-      )} Created a new Turborepo at "${path.relative(process.cwd(), root)}".`;
-
+      )} Created your Turborepo at ${green(
+        path.relative(process.cwd(), root)
+      )}`;
       expect(mockConsole.log).toHaveBeenCalledWith(expected);
+      expect(mockConsole.log).toHaveBeenCalledWith();
+      expect(mockConsole.log).toHaveBeenCalledWith(bold("To get started:"));
+
+      expect(mockConsole.log).toHaveBeenCalledWith(cyan("Library packages"));
+
       expect(mockConsole.log).toHaveBeenCalledWith(
-        "Inside that directory, you can run several commands:"
+        "- Run commands with Turborepo:"
       );
 
       availableScripts.forEach((script) => {
         expect(mockConsole.log).toHaveBeenCalledWith(
-          chalk.cyan(`  ${packageManager} run ${script}`)
+          expect.stringContaining(cyan(`${packageManager} run ${script}`))
         );
       });
+
+      expect(mockConsole.log).toHaveBeenCalledWith(
+        "- Run a command twice to hit cache"
+      );
 
       mockAvailablePackageManagers.mockRestore();
       mockCreateProject.mockRestore();
@@ -144,27 +168,37 @@ describe("create-turbo", () => {
           return "success";
         });
 
-      await create(root as CreateCommandArgument, undefined, {
+      await create(root as CreateCommandArgument, {
         packageManager,
         skipInstall: true,
         example: "default",
+        telemetry,
       });
 
-      const expected = `${chalk.bold(
+      const expected = `${bold(
         logger.turboGradient(">>> Success!")
-      )} Created a new Turborepo at "${path.relative(process.cwd(), root)}".`;
-
+      )} Created your Turborepo at ${green(
+        path.relative(process.cwd(), root)
+      )}`;
       expect(mockConsole.log).toHaveBeenCalledWith(expected);
+      expect(mockConsole.log).toHaveBeenCalledWith();
+      expect(mockConsole.log).toHaveBeenCalledWith(bold("To get started:"));
+
+      expect(mockConsole.log).toHaveBeenCalledWith(cyan("Library packages"));
+
       expect(mockConsole.log).toHaveBeenCalledWith(
-        "Inside that directory, you can run several commands:"
+        "- Run commands with Turborepo:"
       );
 
       availableScripts.forEach((script) => {
         expect(mockConsole.log).toHaveBeenCalledWith(
-          chalk.cyan(`  ${packageManager} run ${script}`)
+          expect.stringContaining(cyan(`${packageManager} run ${script}`))
         );
       });
 
+      expect(mockConsole.log).toHaveBeenCalledWith(
+        "- Run a command twice to hit cache"
+      );
       mockAvailablePackageManagers.mockRestore();
       mockCreateProject.mockRestore();
       mockGetWorkspaceDetails.mockRestore();
@@ -203,25 +237,23 @@ describe("create-turbo", () => {
         return "success";
       });
 
-    await create(
-      root as CreateCommandArgument,
-      packageManager as CreateCommandArgument,
-      {
-        skipInstall: true,
-        example: "default",
-      }
-    );
+    await create(root as CreateCommandArgument, {
+      packageManager,
+      skipInstall: true,
+      example: "default",
+      telemetry,
+    });
 
     expect(mockConsole.error).toHaveBeenCalledTimes(2);
     expect(mockConsole.error).toHaveBeenNthCalledWith(
       1,
-      logger.turboRed.bold(">>>"),
-      chalk.red("Unable to download template from Github")
+      logger.turboRed(bold(">>>")),
+      red("Unable to download template from Github")
     );
     expect(mockConsole.error).toHaveBeenNthCalledWith(
       2,
-      logger.turboRed.bold(">>>"),
-      chalk.red("Could not connect")
+      logger.turboRed(bold(">>>")),
+      red("Could not connect")
     );
     expect(mockExit.exit).toHaveBeenCalledWith(1);
 

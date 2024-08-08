@@ -27,7 +27,8 @@ use tracing::{error, log::warn};
 use turbopath::{AbsoluteSystemPath, AbsoluteSystemPathBuf, AnchoredSystemPath};
 use turborepo_api_client::{spaces::CreateSpaceRunPayload, APIAuth, APIClient};
 use turborepo_env::EnvironmentVariableMap;
-use turborepo_repository::package_graph::{PackageGraph, WorkspaceName};
+use turborepo_repository::package_graph::{PackageGraph, PackageName};
+use turborepo_scm::SCM;
 use turborepo_ui::{color, cprintln, cwriteln, BOLD, BOLD_CYAN, GREY, UI};
 
 use self::{
@@ -36,7 +37,7 @@ use self::{
 use super::task_id::TaskId;
 use crate::{
     cli,
-    cli::DryRunMode,
+    cli::{DryRunMode, EnvMode},
     engine::Engine,
     opts::RunOpts,
     run::summary::{
@@ -55,7 +56,7 @@ pub enum Error {
     #[error("failed to serialize run summary to JSON")]
     Serde(#[from] serde_json::Error),
     #[error("missing workspace {0}")]
-    MissingWorkspace(WorkspaceName),
+    MissingWorkspace(PackageName),
     #[error("request took too long to resolve: {0}")]
     Timeout(#[from] tokio::time::error::Elapsed),
     #[error("failed to send spaces request: {0}")]
@@ -82,26 +83,6 @@ enum RunType {
     DryJson,
 }
 
-// Can't reuse `cli::EnvMode` because the serialization
-// is different (lowercase vs uppercase)
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum EnvMode {
-    Infer,
-    Loose,
-    Strict,
-}
-
-impl From<cli::EnvMode> for EnvMode {
-    fn from(env_mode: cli::EnvMode) -> Self {
-        match env_mode {
-            cli::EnvMode::Infer => EnvMode::Infer,
-            cli::EnvMode::Loose => EnvMode::Loose,
-            cli::EnvMode::Strict => EnvMode::Strict,
-        }
-    }
-}
-
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RunSummary<'a> {
@@ -113,7 +94,7 @@ pub struct RunSummary<'a> {
     global_hash_summary: GlobalHashSummary<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     execution: Option<ExecutionSummary<'a>>,
-    packages: Vec<WorkspaceName>,
+    packages: Vec<&'a PackageName>,
     env_mode: EnvMode,
     framework_inference: bool,
     tasks: Vec<TaskSummary>,
@@ -154,8 +135,9 @@ impl RunTracker {
         spaces_api_client: APIClient,
         api_auth: Option<APIAuth>,
         user: String,
+        scm: &SCM,
     ) -> Self {
-        let scm = SCMState::get(env_at_execution_start, repo_root);
+        let scm = SCMState::get(env_at_execution_start, scm, repo_root);
 
         let spaces_client_handle =
             SpacesClient::new(spaces_id.clone(), spaces_api_client, api_auth).and_then(
@@ -199,8 +181,8 @@ impl RunTracker {
         package_inference_root: Option<&'a AnchoredSystemPath>,
         exit_code: i32,
         end_time: DateTime<Local>,
-        run_opts: &RunOpts<'a>,
-        packages: HashSet<WorkspaceName>,
+        run_opts: &'a RunOpts,
+        packages: &'a HashSet<PackageName>,
         global_hash_summary: GlobalHashSummary<'a>,
         global_env_mode: EnvMode,
         task_factory: TaskSummaryFactory<'a>,
@@ -235,7 +217,7 @@ impl RunTracker {
             id: Ksuid::new(None, None),
             version: RUN_SUMMARY_SCHEMA_VERSION.to_string(),
             turbo_version: self.version,
-            packages: packages.into_iter().sorted().collect(),
+            packages: packages.iter().sorted().collect(),
             execution: Some(execution_summary),
             env_mode: global_env_mode,
             framework_inference: run_opts.framework_inference,
@@ -269,13 +251,14 @@ impl RunTracker {
         ui: UI,
         repo_root: &'a AbsoluteSystemPath,
         package_inference_root: Option<&AnchoredSystemPath>,
-        run_opts: &RunOpts<'a>,
-        packages: HashSet<WorkspaceName>,
+        run_opts: &'a RunOpts,
+        packages: &'a HashSet<PackageName>,
         global_hash_summary: GlobalHashSummary<'a>,
         global_env_mode: cli::EnvMode,
         engine: &'a Engine,
         hash_tracker: TaskHashTracker,
         env_at_execution_start: &'a EnvironmentVariableMap,
+        is_watch: bool,
     ) -> Result<(), Error> {
         let end_time = Local::now();
 
@@ -297,13 +280,13 @@ impl RunTracker {
                 run_opts,
                 packages,
                 global_hash_summary,
-                global_env_mode.into(),
+                global_env_mode,
                 task_factory,
             )
             .await?;
 
         run_summary
-            .finish(end_time, exit_code, pkg_dep_graph, ui)
+            .finish(end_time, exit_code, pkg_dep_graph, ui, is_watch)
             .await
     }
 
@@ -378,6 +361,7 @@ impl<'a> RunSummary<'a> {
         exit_code: i32,
         pkg_dep_graph: &PackageGraph,
         ui: UI,
+        is_watch: bool,
     ) -> Result<(), Error> {
         if matches!(self.run_type, RunType::DryJson | RunType::DryText) {
             return self.close_dry_run(pkg_dep_graph, ui);
@@ -389,10 +373,12 @@ impl<'a> RunSummary<'a> {
             }
         }
 
-        if let Some(execution) = &self.execution {
-            let path = self.get_path();
-            let failed_tasks = self.get_failed_tasks();
-            execution.print(ui, path, failed_tasks);
+        if !is_watch {
+            if let Some(execution) = &self.execution {
+                let path = self.get_path();
+                let failed_tasks = self.get_failed_tasks();
+                execution.print(ui, path, failed_tasks);
+            }
         }
 
         if let Some(spaces_client_handle) = self.spaces_client_handle.take() {
@@ -461,12 +447,12 @@ impl<'a> RunSummary<'a> {
             let mut tab_writer = TabWriter::new(io::stdout()).minwidth(0).padding(1);
             writeln!(tab_writer, "Name\tPath\t")?;
             for pkg in &self.packages {
-                if matches!(pkg, WorkspaceName::Root) {
+                if matches!(pkg, PackageName::Root) {
                     continue;
                 }
                 let dir = pkg_dep_graph
-                    .workspace_info(pkg)
-                    .ok_or_else(|| Error::MissingWorkspace(pkg.clone()))?
+                    .package_info(pkg)
+                    .ok_or_else(|| Error::MissingWorkspace((*pkg).to_owned()))?
                     .package_path();
 
                 writeln!(tab_writer, "{}\t{}", pkg, dir)?;
@@ -492,16 +478,6 @@ impl<'a> RunSummary<'a> {
             GREY,
             "  Global Cache Key\t=\t{}",
             self.global_hash_summary.root_key
-        )?;
-        cwriteln!(
-            tab_writer,
-            ui,
-            GREY,
-            "  Global .env Files Considered\t=\t{}",
-            self.global_hash_summary
-                .global_dot_env
-                .unwrap_or_default()
-                .len()
         )?;
         cwriteln!(
             tab_writer,
@@ -561,6 +537,20 @@ impl<'a> RunSummary<'a> {
                 .as_deref()
                 .unwrap_or_default()
                 .join(", ")
+        )?;
+        cwriteln!(
+            tab_writer,
+            ui,
+            GREY,
+            "  Engines Values\t=\t{}",
+            self.global_hash_summary
+                .engines
+                .as_ref()
+                .map(|engines| engines
+                    .iter()
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .join(", "))
+                .unwrap_or_default()
         )?;
 
         tab_writer.flush()?;
@@ -654,16 +644,6 @@ impl<'a> RunSummary<'a> {
                 GREY,
                 "  Inputs Files Considered\t=\t{}",
                 task.shared.inputs.len()
-            )?;
-            cwriteln!(
-                tab_writer,
-                ui,
-                GREY,
-                "  .env Files Considered\t=\t{}",
-                task.shared
-                    .dot_env
-                    .as_ref()
-                    .map_or(0, |dot_env| dot_env.len())
             )?;
 
             cwriteln!(
@@ -768,6 +748,12 @@ impl<'a> RunSummary<'a> {
         }
 
         self.tasks.sort_by(|a, b| a.task_id.cmp(&b.task_id));
+
+        // Sort dependencies
+        for task in &mut self.tasks {
+            task.shared.dependencies.sort();
+            task.shared.dependents.sort();
+        }
     }
 
     fn get_path(&self) -> AbsoluteSystemPathBuf {

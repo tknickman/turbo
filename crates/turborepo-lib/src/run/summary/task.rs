@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use itertools::Itertools;
 use serde::Serialize;
 use turbopath::{AnchoredSystemPathBuf, RelativeUnixPathBuf};
 use turborepo_cache::CacheHitMetadata;
@@ -82,7 +81,6 @@ pub(crate) struct SharedTaskSummary<T> {
     pub framework: String,
     pub env_mode: EnvMode,
     pub environment_variables: TaskEnvVarSummary,
-    pub dot_env: Option<Vec<RelativeUnixPathBuf>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub execution: Option<TaskExecutionSummary>,
 }
@@ -101,11 +99,11 @@ pub struct TaskSummaryTaskDefinition {
     cache: bool,
     depends_on: Vec<String>,
     inputs: Vec<String>,
-    output_mode: OutputLogsMode,
+    output_logs: OutputLogsMode,
     persistent: bool,
     env: Vec<String>,
     pass_through_env: Option<Vec<String>>,
-    dot_env: Option<Vec<RelativeUnixPathBuf>>,
+    interactive: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -233,7 +231,6 @@ impl From<SharedTaskSummary<TaskId<'static>>> for SharedTaskSummary<String> {
             execution,
             env_mode,
             environment_variables,
-            dot_env,
             ..
         } = value;
         Self {
@@ -251,19 +248,16 @@ impl From<SharedTaskSummary<TaskId<'static>>> for SharedTaskSummary<String> {
             dependencies: dependencies
                 .into_iter()
                 .map(|task_id| task_id.task().to_string())
-                .sorted()
                 .collect(),
             dependents: dependents
                 .into_iter()
                 .map(|task_id| task_id.task().to_string())
-                .sorted()
                 .collect(),
             resolved_task_definition,
             framework,
             execution,
             env_mode,
             environment_variables,
-            dot_env,
         }
     }
 }
@@ -279,12 +273,12 @@ impl From<TaskDefinition> for TaskSummaryTaskDefinition {
             cache,
             mut env,
             pass_through_env,
-            dot_env,
             topological_dependencies,
             task_dependencies,
             mut inputs,
-            output_mode,
+            output_logs,
             persistent,
+            interactive,
         } = value;
 
         let mut outputs = inclusions;
@@ -298,7 +292,7 @@ impl From<TaskDefinition> for TaskSummaryTaskDefinition {
             depends_on.push(task_dependency.to_string());
         }
         for topological_dependency in topological_dependencies {
-            depends_on.push(format!("^{topological_dependency}"));
+            depends_on.push(format!("^{}", topological_dependency.as_inner()));
         }
 
         // These _should_ already be sorted when the TaskDefinition struct was
@@ -314,12 +308,11 @@ impl From<TaskDefinition> for TaskSummaryTaskDefinition {
             cache,
             depends_on,
             inputs,
-            output_mode,
+            output_logs,
             persistent,
+            interactive,
             env,
             pass_through_env,
-            // This should _not_ be sorted.
-            dot_env,
         }
     }
 }
@@ -373,11 +366,11 @@ mod test {
             "cache": true,
             "dependsOn": [],
             "inputs": [],
-            "outputMode": "full",
+            "outputLogs": "full",
             "persistent": false,
+            "interactive": false,
             "env": [],
             "passThroughEnv": null,
-            "dotEnv": null,
         })
         ; "resolved task definition"
     )]

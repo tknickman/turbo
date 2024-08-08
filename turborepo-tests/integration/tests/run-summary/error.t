@@ -9,7 +9,7 @@ that behavior in this test.
   $ ${TURBO} run maybefails --filter=my-app --summarize > /dev/null 2>&1
   [1]
 
-  $ source "$TESTDIR/../_helpers/run-summary-utils.sh"
+  $ source "$TESTDIR/../../../helpers/run_summary.sh"
   $ SUMMARY=$(/bin/ls .turbo/runs/*.json | head -n1)
 
 Validate that there was a failed task and exitCode is 1 (which is what we get from npm for the failed task)
@@ -32,7 +32,7 @@ Validate that we got a full task summary for the failed task with an error in .e
     "taskId": "my-app#maybefails",
     "task": "maybefails",
     "package": "my-app",
-    "hash": "9626dfcd1fbbdc68",
+    "hash": "9f05a7188fdf4e93",
     "inputs": {
       ".env.local": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
       "package.json": "1746e0db2361085b5953a6a3beab08c24af5bc08"
@@ -57,15 +57,15 @@ Validate that we got a full task summary for the failed task with an error in .e
       "cache": true,
       "dependsOn": [],
       "inputs": [],
-      "outputMode": "full",
+      "outputLogs": "full",
       "persistent": false,
       "env": [],
       "passThroughEnv": null,
-      "dotEnv": null
+      "interactive": false
     },
     "expandedOutputs": [],
     "framework": "",
-    "envMode": "loose",
+    "envMode": "strict",
     "environmentVariables": {
       "specified": {
         "env": [],
@@ -75,7 +75,6 @@ Validate that we got a full task summary for the failed task with an error in .e
       "inferred": [],
       "passthrough": null
     },
-    "dotEnv": null,
     "execution": {
       "startTime": [0-9]+, (re)
       "endTime": [0-9]+, (re)
@@ -91,7 +90,7 @@ Don't use --filter here, so we can validate that both tasks attempted to run
   $ ${TURBO} run maybefails --summarize --force --continue > /dev/null  2>&1
   [1]
 
-  $ source "$TESTDIR/../_helpers/run-summary-utils.sh"
+  $ source "$TESTDIR/../../../helpers/run_summary.sh"
   $ SUMMARY=$(/bin/ls .turbo/runs/*.json | head -n1)
 
 success should be 1, and attempted should be 2

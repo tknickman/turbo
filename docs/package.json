@@ -1,70 +1,29 @@
 {
-  "name": "docs",
-  "version": "1.0.0",
   "private": true,
-  "description": "turbo.build",
+  "type": "module",
+  "exports": "./dist/index.js",
+  "files": [
+    "src"
+  ],
   "scripts": {
-    "dev": "next",
-    "start": "next start",
-    "build": "next build && pagefind --site .next --output-path .next/static/chunks/pagefind",
-    "lint": "eslint . --max-warnings 0",
-    "check-types": "tsc --noEmit",
-    "rss": "node scripts/generate-rss.js",
-    "schema": "turbo-types-generate ./public/schema.json",
-    "lint:prettier": "prettier -c . --cache --ignore-path=../.prettierignore"
-  },
-  "author": "Jared Palmer",
-  "license": "MPL-2.0",
-  "dependencies": {
-    "@headlessui/react": "^1.7.17",
-    "@heroicons/react": "1.0.6",
-    "@mdx-js/react": "^3.0.0",
-    "@react-spring/web": "^9.7.3",
-    "@sentry/nextjs": "^7.88.0",
-    "@vercel/analytics": "^0.1.1",
-    "@vercel/og": "^0.6.1",
-    "@vercel/speed-insights": "1.0.5-beta.1",
-    "@vercel/toolbar": "^0.1.9",
-    "axios": "1.6.2",
-    "classnames": "2.3.2",
-    "copy-to-clipboard": "^3.3.3",
-    "framer-motion": "^10.16.16",
-    "next": "^14.0.4",
-    "next-themes": "^0.2.1",
-    "nextra": "^2.13.2",
-    "nextra-theme-docs": "^2.13.2",
-    "node-fetch": "^3.3.2",
-    "react": "^18",
-    "react-dom": "^18",
-    "sharp": "^0.33.0",
-    "swr": "2.2.4"
+    "check-links": "tsx src/validate-docs-links.ts"
   },
   "devDependencies": {
-    "@babel/core": "7.23.6",
-    "@next/eslint-plugin-next": "^14.0.4",
-    "@turbo/eslint-config": "workspace:*",
-    "@turbo/gen": "workspace:*",
-    "@turbo/types": "workspace:*",
-    "@types/node": "^20.10.4",
-    "@types/react": "^18",
-    "@types/react-dom": "^18",
-    "@typescript-eslint/eslint-plugin": "^6.14.0",
-    "@typescript-eslint/parser": "^6.14.0",
-    "autoprefixer": "10.4.16",
-    "csstype": "3.1.3",
-    "eslint": "^8.55.0",
-    "gray-matter": "^4.0.3",
-    "pagefind": "^1.0.4",
-    "postcss": "8.4.32",
-    "rss": "^1.2.2",
-    "tailwindcss": "3.3.6",
-    "typescript": "5.3.3"
+    "@types/github-slugger": "^1.3.0",
+    "@types/node": "^22.1.0",
+    "@vercel/ncc": "0.34.0",
+    "tsx": "^4.7.2",
+    "typescript": "5.1.6"
   },
-  "prettier": {
-    "embeddedLanguageFormatting": "off",
-    "htmlWhitespaceSensitivity": "strict"
-  },
-  "engines": {
-    "node": "20.x"
+  "dependencies": {
+    "@actions/core": "^1.10.0",
+    "@actions/github": "^5.1.1",
+    "github-slugger": "1.2.0",
+    "gray-matter": "4.0.2",
+    "rehype-raw": "4.0.1",
+    "remark-parse": "7.0.1",
+    "remark-rehype": "5.0.0",
+    "unified": "8.4.1",
+    "unist-util-visit": "2.0.0"
   }
 }

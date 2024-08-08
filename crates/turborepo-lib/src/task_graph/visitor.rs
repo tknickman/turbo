@@ -2,45 +2,48 @@ use std::{
     borrow::Cow,
     collections::HashSet,
     io::Write,
-    process::Stdio,
     sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
 use console::{Style, StyledObject};
+use either::Either;
 use futures::{stream::FuturesUnordered, StreamExt};
+use itertools::Itertools;
+use miette::{Diagnostic, NamedSource, SourceSpan};
 use regex::Regex;
-use tokio::{
-    process::Command,
-    sync::{mpsc, oneshot},
-};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, Instrument, Span};
-use turbopath::{AbsoluteSystemPath, AbsoluteSystemPathBuf};
-use turborepo_ci::github_header_footer;
-use turborepo_env::{EnvironmentVariableMap, ResolvedEnvMode};
+use turbopath::{AbsoluteSystemPath, AbsoluteSystemPathBuf, AnchoredSystemPath};
+use turborepo_ci::{Vendor, VendorBehavior};
+use turborepo_env::EnvironmentVariableMap;
 use turborepo_repository::{
-    package_graph::{PackageGraph, WorkspaceName, ROOT_PKG_NAME},
+    package_graph::{PackageGraph, PackageName, ROOT_PKG_NAME},
     package_manager::PackageManager,
 };
 use turborepo_telemetry::events::{
     generic::GenericEventBuilder, task::PackageTaskEventBuilder, EventBuilder, TrackedErrors,
 };
-use turborepo_ui::{ColorSelector, OutputClient, OutputSink, OutputWriter, PrefixedUI, UI};
+use turborepo_ui::{
+    tui::{self, event::CacheResult, AppSender, TuiTask},
+    ColorSelector, OutputClient, OutputSink, OutputWriter, PrefixedUI, UI,
+};
 use which::which;
 
 use crate::{
     cli::EnvMode,
     engine::{Engine, ExecutionOptions, StopExecution},
-    opts::Opts,
-    process::{ChildExit, ProcessManager},
+    opts::RunOpts,
+    process::{ChildExit, Command, ProcessManager},
     run::{
         global_hash::GlobalHashableInputs,
         summary::{
             self, GlobalHashSummary, RunTracker, SpacesTaskClient, SpacesTaskInformation,
             TaskExecutionSummary, TaskTracker,
         },
+        task_access::TaskAccess,
         task_id::TaskId,
-        RunCache, TaskCache,
+        CacheOutput, RunCache, TaskCache,
     },
     task_hash::{self, PackageInputsHashes, TaskHashTracker, TaskHashTrackerState, TaskHasher},
 };
@@ -52,27 +55,37 @@ pub struct Visitor<'a> {
     global_env: EnvironmentVariableMap,
     global_env_mode: EnvMode,
     manager: ProcessManager,
-    opts: &'a Opts<'a>,
+    run_opts: &'a RunOpts,
     package_graph: Arc<PackageGraph>,
     repo_root: &'a AbsoluteSystemPath,
     run_cache: Arc<RunCache>,
     run_tracker: RunTracker,
+    task_access: &'a TaskAccess,
     sink: OutputSink<StdWriter>,
     task_hasher: TaskHasher<'a>,
     ui: UI,
+    experimental_ui_sender: Option<AppSender>,
+    is_watch: bool,
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, thiserror::Error, Diagnostic)]
 pub enum Error {
     #[error("cannot find package {package_name} for task {task_id}")]
     MissingPackage {
-        package_name: WorkspaceName,
+        package_name: PackageName,
         task_id: TaskId<'static>,
     },
     #[error(
         "root task {task_name} ({command}) looks like it invokes turbo and might cause a loop"
     )]
-    RecursiveTurbo { task_name: String, command: String },
+    RecursiveTurbo {
+        task_name: String,
+        command: String,
+        #[label("task found here")]
+        span: Option<SourceSpan>,
+        #[source_code]
+        text: NamedSource,
+    },
     #[error("Could not find definition for task")]
     MissingDefinition,
     #[error("error while executing engine: {0}")]
@@ -81,6 +94,8 @@ pub enum Error {
     TaskHash(#[from] task_hash::Error),
     #[error(transparent)]
     RunSummary(#[from] summary::Error),
+    #[error("internal errors encountered: {0}")]
+    InternalErrors(String),
 }
 
 impl<'a> Visitor<'a> {
@@ -92,24 +107,27 @@ impl<'a> Visitor<'a> {
         package_graph: Arc<PackageGraph>,
         run_cache: Arc<RunCache>,
         run_tracker: RunTracker,
-        opts: &'a Opts,
+        task_access: &'a TaskAccess,
+        run_opts: &'a RunOpts,
         package_inputs_hashes: PackageInputsHashes,
         env_at_execution_start: &'a EnvironmentVariableMap,
         global_hash: &'a str,
         global_env_mode: EnvMode,
         ui: UI,
-        silent: bool,
         manager: ProcessManager,
         repo_root: &'a AbsoluteSystemPath,
         global_env: EnvironmentVariableMap,
+        experimental_ui_sender: Option<AppSender>,
+        is_watch: bool,
     ) -> Self {
         let task_hasher = TaskHasher::new(
             package_inputs_hashes,
-            opts,
+            run_opts,
             env_at_execution_start,
             global_hash,
         );
-        let sink = Self::sink(opts, silent);
+
+        let sink = Self::sink(run_opts);
         let color_cache = ColorSelector::default();
 
         Self {
@@ -117,15 +135,18 @@ impl<'a> Visitor<'a> {
             dry: false,
             global_env_mode,
             manager,
-            opts,
+            run_opts,
             package_graph,
             repo_root,
             run_cache,
             run_tracker,
+            task_access,
             sink,
             task_hasher,
             ui,
             global_env,
+            experimental_ui_sender,
+            is_watch,
         }
     }
 
@@ -135,15 +156,15 @@ impl<'a> Visitor<'a> {
         engine: Arc<Engine>,
         telemetry: &GenericEventBuilder,
     ) -> Result<Vec<TaskError>, Error> {
-        let concurrency = self.opts.run_opts.concurrency as usize;
+        let concurrency = self.run_opts.concurrency as usize;
         let (node_sender, mut node_stream) = mpsc::channel(concurrency);
+
         let engine_handle = {
             let engine = engine.clone();
             tokio::spawn(engine.execute(ExecutionOptions::new(false, concurrency), node_sender))
         };
         let mut tasks = FuturesUnordered::new();
         let errors = Arc::new(Mutex::new(Vec::new()));
-
         let span = Span::current();
 
         let factory = ExecContextFactory::new(self, errors.clone(), self.manager.clone(), &engine);
@@ -152,15 +173,15 @@ impl<'a> Visitor<'a> {
             let span = tracing::debug_span!(parent: &span, "queue_task", task = %message.info);
             let _enter = span.enter();
             let crate::engine::Message { info, callback } = message;
-            let package_name = WorkspaceName::from(info.package());
+            let package_name = PackageName::from(info.package());
 
-            let workspace_info = self
-                .package_graph
-                .workspace_info(&package_name)
-                .ok_or_else(|| Error::MissingPackage {
-                    package_name: package_name.clone(),
-                    task_id: info.clone(),
-                })?;
+            let workspace_info =
+                self.package_graph
+                    .package_info(&package_name)
+                    .ok_or_else(|| Error::MissingPackage {
+                        package_name: package_name.clone(),
+                        task_id: info.clone(),
+                    })?;
 
             let package_task_event =
                 PackageTaskEventBuilder::new(info.package(), info.task()).with_parent(telemetry);
@@ -173,9 +194,12 @@ impl<'a> Visitor<'a> {
             match command {
                 Some(cmd) if info.package() == ROOT_PKG_NAME && turbo_regex().is_match(&cmd) => {
                     package_task_event.track_error(TrackedErrors::RecursiveError);
+                    let (span, text) = cmd.span_and_text("package.json");
                     return Err(Error::RecursiveTurbo {
                         task_name: info.to_string(),
                         command: cmd.to_string(),
+                        span,
+                        text,
                     });
                 }
                 _ => (),
@@ -185,18 +209,7 @@ impl<'a> Visitor<'a> {
                 .task_definition(&info)
                 .ok_or(Error::MissingDefinition)?;
 
-            let task_env_mode = match self.global_env_mode {
-                // Task env mode is only independent when global env mode is `infer`.
-                EnvMode::Infer if task_definition.pass_through_env.is_some() => {
-                    ResolvedEnvMode::Strict
-                }
-                // If we're in infer mode we have just detected non-usage of strict env vars.
-                // But our behavior's actual meaning of this state is `loose`.
-                EnvMode::Infer => ResolvedEnvMode::Loose,
-                // Otherwise we just use the global env mode.
-                EnvMode::Strict => ResolvedEnvMode::Strict,
-                EnvMode::Loose => ResolvedEnvMode::Loose,
-            };
+            let task_env_mode = self.global_env_mode;
             package_task_event.track_env_mode(&task_env_mode.to_string());
 
             let dependency_set = engine.dependencies(&info).ok_or(Error::MissingDefinition)?;
@@ -236,11 +249,11 @@ impl<'a> Visitor<'a> {
                         factory.dry_run_exec_context(info.clone(), task_cache);
                     let tracker = self.run_tracker.track_task(info.into_owned());
                     tasks.push(tokio::spawn(async move {
-                        dry_run_exec_context.execute_dry_run(tracker).await;
+                        dry_run_exec_context.execute_dry_run(tracker).await
                     }));
                 }
                 false => {
-                    // TODO(gsoltis): if/when we fix https://github.com/vercel/turbo/issues/937
+                    // TODO(gsoltis): if/when we fix https://github.com/vercel/turborepo/issues/937
                     // the following block should never get hit. In the meantime, keep it after
                     // hashing so that downstream tasks can count on the hash existing
                     //
@@ -251,15 +264,25 @@ impl<'a> Visitor<'a> {
 
                     let workspace_directory = self.repo_root.resolve(workspace_info.package_path());
 
+                    let takes_input = task_definition.interactive || task_definition.persistent;
                     let mut exec_context = factory.exec_context(
                         info.clone(),
                         task_hash,
                         task_cache,
                         workspace_directory,
                         execution_env,
+                        takes_input,
+                        self.task_access.clone(),
                     );
 
-                    let output_client = self.output_client(&info);
+                    let vendor_behavior =
+                        Vendor::infer().and_then(|vendor| vendor.behavior.as_ref());
+
+                    let output_client = if let Some(handle) = &self.experimental_ui_sender {
+                        TaskOutput::UI(handle.task(info.to_string()))
+                    } else {
+                        TaskOutput::Direct(self.output_client(&info, vendor_behavior))
+                    };
                     let tracker = self.run_tracker.track_task(info.clone().into_owned());
                     let spaces_client = self.run_tracker.spaces_task_client();
                     let parent_span = Span::current();
@@ -275,7 +298,7 @@ impl<'a> Visitor<'a> {
                                 spaces_client,
                                 &execution_telemetry,
                             )
-                            .await;
+                            .await
                     }));
                 }
             }
@@ -284,10 +307,28 @@ impl<'a> Visitor<'a> {
         // Wait for the engine task to finish and for all of our tasks to finish
         engine_handle.await.expect("engine execution panicked")?;
         // This will poll the futures until they are all completed
+        let mut internal_errors = Vec::new();
         while let Some(result) = tasks.next().await {
-            result.expect("task executor panicked");
+            if let Err(e) = result.unwrap_or_else(|e| panic!("task executor panicked: {e}")) {
+                internal_errors.push(e);
+            }
         }
         drop(factory);
+
+        if !self.is_watch {
+            if let Some(handle) = &self.experimental_ui_sender {
+                handle.stop();
+            }
+        }
+
+        if !internal_errors.is_empty() {
+            return Err(Error::InternalErrors(
+                internal_errors.into_iter().map(|e| e.to_string()).join(","),
+            ));
+        }
+
+        // Write out the traced-config.json file if we have one
+        self.task_access.save().await;
 
         let errors = Arc::into_inner(errors)
             .expect("only one strong reference to errors should remain")
@@ -299,6 +340,8 @@ impl<'a> Visitor<'a> {
 
     /// Finishes visiting the tasks, creates the run summary, and either
     /// prints, saves, or sends it to spaces.
+
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(
         self,
         packages,
@@ -309,18 +352,20 @@ impl<'a> Visitor<'a> {
     pub(crate) async fn finish(
         self,
         exit_code: i32,
-        packages: HashSet<WorkspaceName>,
+        packages: &HashSet<PackageName>,
         global_hash_inputs: GlobalHashableInputs<'_>,
         engine: &Engine,
         env_at_execution_start: &EnvironmentVariableMap,
+        pkg_inference_root: Option<&AnchoredSystemPath>,
     ) -> Result<(), Error> {
         let Self {
             package_graph,
             ui,
-            opts,
+            run_opts,
             repo_root,
             global_env_mode,
             task_hasher,
+            is_watch,
             ..
         } = self;
 
@@ -333,22 +378,21 @@ impl<'a> Visitor<'a> {
                 &package_graph,
                 ui,
                 repo_root,
-                opts.scope_opts.pkg_inference_root.as_deref(),
-                &opts.run_opts,
+                pkg_inference_root,
+                run_opts,
                 packages,
                 global_hash_summary,
                 global_env_mode,
                 engine,
                 task_hasher.task_hash_tracker(),
                 env_at_execution_start,
+                is_watch,
             )
             .await?)
     }
 
-    fn sink(opts: &Opts, silent: bool) -> OutputSink<StdWriter> {
-        let (out, err) = if silent {
-            (std::io::sink().into(), std::io::sink().into())
-        } else if opts.run_opts.should_redirect_stderr_to_stdout() {
+    fn sink(run_opts: &RunOpts) -> OutputSink<StdWriter> {
+        let (out, err) = if run_opts.should_redirect_stderr_to_stdout() {
             (std::io::stdout().into(), std::io::stdout().into())
         } else {
             (std::io::stdout().into(), std::io::stderr().into())
@@ -356,8 +400,12 @@ impl<'a> Visitor<'a> {
         OutputSink::new(out, err)
     }
 
-    fn output_client(&self, task_id: &TaskId) -> OutputClient<impl std::io::Write> {
-        let behavior = match self.opts.run_opts.log_order {
+    fn output_client(
+        &self,
+        task_id: &TaskId,
+        vendor_behavior: Option<&VendorBehavior>,
+    ) -> OutputClient<impl std::io::Write> {
+        let behavior = match self.run_opts.log_order {
             crate::opts::ResolvedLogOrder::Stream if self.run_tracker.spaces_enabled() => {
                 turborepo_ui::OutputClientBehavior::InMemoryBuffer
             }
@@ -368,21 +416,34 @@ impl<'a> Visitor<'a> {
         };
 
         let mut logger = self.sink.logger(behavior);
-        if self.opts.run_opts.is_github_actions {
-            let package = if self.opts.run_opts.single_package {
-                None
+        if let Some(vendor_behavior) = vendor_behavior {
+            let group_name = if self.run_opts.single_package {
+                task_id.task().to_string()
             } else {
-                Some(task_id.package())
+                format!("{}:{}", task_id.package(), task_id.task())
             };
-            let (header, footer) = github_header_footer(package, task_id.task());
-            logger.with_header_footer(Some(header), Some(footer));
+
+            let header_factory = (vendor_behavior.group_prefix)(group_name.to_owned());
+            let footer_factory = (vendor_behavior.group_suffix)(group_name.to_owned());
+
+            logger.with_header_footer(Some(header_factory), Some(footer_factory));
+
+            let (error_header, error_footer) = (
+                vendor_behavior
+                    .error_group_prefix
+                    .map(|f| f(group_name.to_owned())),
+                vendor_behavior
+                    .error_group_suffix
+                    .map(|f| f(group_name.to_owned())),
+            );
+            logger.with_error_header_footer(error_header, error_footer);
         }
         logger
     }
 
     fn prefix<'b>(&self, task_id: &'b TaskId) -> Cow<'b, str> {
-        match self.opts.run_opts.log_prefix {
-            crate::opts::ResolvedLogPrefix::Task if self.opts.run_opts.single_package => {
+        match self.run_opts.log_prefix {
+            crate::opts::ResolvedLogPrefix::Task if self.run_opts.single_package => {
                 task_id.task().into()
             }
             crate::opts::ResolvedLogPrefix::Task => {
@@ -394,7 +455,7 @@ impl<'a> Visitor<'a> {
 
     // Task ID as displayed in error messages
     fn display_task_id(&self, task_id: &TaskId) -> String {
-        match self.opts.run_opts.single_package {
+        match self.run_opts.single_package {
             true => task_id.task().to_string(),
             false => task_id.to_string(),
         }
@@ -403,10 +464,11 @@ impl<'a> Visitor<'a> {
     fn prefixed_ui<W: Write>(
         ui: UI,
         is_github_actions: bool,
-        client: &OutputClient<W>,
+        stdout: W,
+        stderr: W,
         prefix: StyledObject<String>,
-    ) -> PrefixedUI<OutputWriter<'_, W>> {
-        let mut prefixed_ui = PrefixedUI::new(ui, client.stdout(), client.stderr())
+    ) -> PrefixedUI<W> {
+        let mut prefixed_ui = PrefixedUI::new(ui, stdout, stderr)
             .with_output_prefix(prefix.clone())
             // TODO: we can probably come up with a more ergonomic way to achieve this
             .with_error_prefix(
@@ -429,6 +491,8 @@ impl<'a> Visitor<'a> {
 
     pub fn dry_run(&mut self) {
         self.dry = true;
+        // No need to start a TUI on dry run
+        self.experimental_ui_sender = None;
     }
 }
 
@@ -478,6 +542,13 @@ impl std::io::Write for StdWriter {
     }
 }
 
+/// Small wrapper over our two output types that defines a shared interface for
+/// interacting with them.
+enum TaskOutput<W> {
+    Direct(OutputClient<W>),
+    UI(tui::TuiTask),
+}
+
 fn turbo_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| Regex::new(r"(?:^|\s)turbo(?:$|\s)").unwrap())
@@ -498,6 +569,22 @@ enum TaskErrorCause {
     Spawn { msg: String },
     #[error("command {command} exited ({exit_code})")]
     Exit { command: String, exit_code: i32 },
+    #[error("turbo has internal error processing task")]
+    Internal,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum InternalError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("unable to determine why task exited")]
+    UnknownChildExit,
+    #[error("unable to find package manager binary: {0}")]
+    Which(#[from] which::Error),
+    #[error("external process killed a task")]
+    ExternalKill,
+    #[error("error writing logs: {0}")]
+    Logs(#[from] crate::run::CacheError),
 }
 
 impl TaskError {
@@ -559,6 +646,7 @@ impl<'a> ExecContextFactory<'a> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn exec_context(
         &self,
         task_id: TaskId<'static>,
@@ -566,13 +654,16 @@ impl<'a> ExecContextFactory<'a> {
         task_cache: TaskCache,
         workspace_directory: AbsoluteSystemPathBuf,
         execution_env: EnvironmentVariableMap,
+        takes_input: bool,
+        task_access: TaskAccess,
     ) -> ExecContext {
         let task_id_for_display = self.visitor.display_task_id(&task_id);
-        let pass_through_args = self.visitor.opts.run_opts.args_for_task(&task_id);
+        let pass_through_args = self.visitor.run_opts.args_for_task(&task_id);
         ExecContext {
             engine: self.engine.clone(),
             ui: self.visitor.ui,
-            is_github_actions: self.visitor.opts.run_opts.is_github_actions,
+            experimental_ui: self.visitor.experimental_ui_sender.is_some(),
+            is_github_actions: self.visitor.run_opts.is_github_actions,
             pretty_prefix: self
                 .visitor
                 .color_cache
@@ -586,9 +677,11 @@ impl<'a> ExecContextFactory<'a> {
             manager: self.manager.clone(),
             task_hash,
             execution_env,
-            continue_on_error: self.visitor.opts.run_opts.continue_on_error,
+            continue_on_error: self.visitor.run_opts.continue_on_error,
             pass_through_args,
             errors: self.errors.clone(),
+            takes_input,
+            task_access,
         }
     }
 
@@ -608,6 +701,7 @@ impl<'a> ExecContextFactory<'a> {
 struct ExecContext {
     engine: Arc<Engine>,
     ui: UI,
+    experimental_ui: bool,
     is_github_actions: bool,
     pretty_prefix: StyledObject<String>,
     task_id: TaskId<'static>,
@@ -622,18 +716,20 @@ struct ExecContext {
     continue_on_error: bool,
     pass_through_args: Option<Vec<String>>,
     errors: Arc<Mutex<Vec<TaskError>>>,
+    takes_input: bool,
+    task_access: TaskAccess,
 }
 
 enum ExecOutcome {
     // All operations during execution succeeded
     Success(SuccessOutcome),
-    // An internal error that indicates a shutdown should be performed
-    Internal,
     // An error with the task execution
     Task {
         exit_code: Option<i32>,
         message: String,
     },
+    // Task didn't execute normally due to a shutdown being initiated by another task
+    Shutdown,
 }
 
 enum SuccessOutcome {
@@ -654,11 +750,11 @@ impl ExecContext {
         &mut self,
         parent_span_id: Option<tracing::Id>,
         tracker: TaskTracker<()>,
-        output_client: OutputClient<impl std::io::Write>,
+        output_client: TaskOutput<impl std::io::Write>,
         callback: oneshot::Sender<Result<(), StopExecution>>,
         spaces_client: Option<SpacesTaskClient>,
         telemetry: &PackageTaskEventBuilder,
-    ) {
+    ) -> Result<(), InternalError> {
         let tracker = tracker.start().await;
         let span = tracing::debug_span!("execute_task", task = %self.task_id.task());
         span.follows_from(parent_span_id);
@@ -667,18 +763,22 @@ impl ExecContext {
             .instrument(span)
             .await;
 
-        let logs = match output_client.finish() {
+        // If the task resulted in an error, do not group in order to better highlight
+        // the error.
+        let is_error = matches!(result, Ok(ExecOutcome::Task { .. }));
+        let is_cache_hit = matches!(result, Ok(ExecOutcome::Success(SuccessOutcome::CacheHit)));
+        let logs = match output_client.finish(is_error, is_cache_hit) {
             Ok(logs) => logs,
             Err(e) => {
                 telemetry.track_error(TrackedErrors::DaemonFailedToMarkOutputsAsCached);
                 error!("unable to flush output client: {e}");
-                result = ExecOutcome::Internal;
+                result = Err(InternalError::Io(e));
                 None
             }
         };
 
         match result {
-            ExecOutcome::Success(outcome) => {
+            Ok(ExecOutcome::Success(outcome)) => {
                 let task_summary = match outcome {
                     SuccessOutcome::CacheHit => tracker.cached().await,
                     SuccessOutcome::Run => tracker.build_succeeded(0).await,
@@ -690,12 +790,7 @@ impl ExecContext {
                     client.finish_task(info).await.ok();
                 }
             }
-            ExecOutcome::Internal => {
-                tracker.cancel();
-                callback.send(Err(StopExecution)).ok();
-                self.manager.stop().await;
-            }
-            ExecOutcome::Task { exit_code, message } => {
+            Ok(ExecOutcome::Task { exit_code, message }) => {
                 let task_summary = tracker.build_failed(exit_code, message).await;
                 callback
                     .send(match self.continue_on_error {
@@ -726,21 +821,54 @@ impl ExecContext {
                     }
                 }
             }
+            Ok(ExecOutcome::Shutdown) => {
+                tracker.cancel();
+                callback.send(Err(StopExecution)).ok();
+                // Probably overkill here, but we should make sure the process manager is
+                // stopped if we think we're shutting down.
+                self.manager.stop().await;
+            }
+            Err(e) => {
+                tracker.cancel();
+                callback.send(Err(StopExecution)).ok();
+                self.manager.stop().await;
+                return Err(e);
+            }
+        }
+
+        Ok(())
+    }
+
+    fn prefixed_ui<'a, W: Write>(
+        &self,
+        output_client: &'a TaskOutput<W>,
+    ) -> TaskCacheOutput<OutputWriter<'a, W>> {
+        match output_client {
+            TaskOutput::Direct(client) => TaskCacheOutput::Direct(Visitor::prefixed_ui(
+                self.ui,
+                self.is_github_actions,
+                client.stdout(),
+                client.stderr(),
+                self.pretty_prefix.clone(),
+            )),
+            TaskOutput::UI(task) => TaskCacheOutput::UI(task.clone()),
         }
     }
 
     async fn execute_inner(
         &mut self,
-        output_client: &OutputClient<impl std::io::Write>,
+        output_client: &TaskOutput<impl std::io::Write>,
         telemetry: &PackageTaskEventBuilder,
-    ) -> ExecOutcome {
+    ) -> Result<ExecOutcome, InternalError> {
         let task_start = Instant::now();
-        let mut prefixed_ui = Visitor::prefixed_ui(
-            self.ui,
-            self.is_github_actions,
-            output_client,
-            self.pretty_prefix.clone(),
-        );
+        let mut prefixed_ui = self.prefixed_ui(output_client);
+
+        if self.experimental_ui {
+            if let TaskOutput::UI(task) = output_client {
+                let output_logs = self.task_cache.output_logs().into();
+                task.start(output_logs);
+            }
+        }
 
         match self
             .task_cache
@@ -755,18 +883,16 @@ impl ExecContext {
                 );
                 self.hash_tracker
                     .insert_cache_status(self.task_id.clone(), status);
-                return ExecOutcome::Success(SuccessOutcome::CacheHit);
+                return Ok(ExecOutcome::Success(SuccessOutcome::CacheHit));
             }
             Ok(None) => (),
             Err(e) => {
                 telemetry.track_error(TrackedErrors::ErrorFetchingFromCache);
-                prefixed_ui.error(format!("error fetching from cache: {e}"));
+                prefixed_ui.error(&format!("error fetching from cache: {e}"));
             }
         }
 
-        let Ok(package_manager_binary) = which(self.package_manager.command()) else {
-            return ExecOutcome::Internal;
-        };
+        let package_manager_binary = which(self.package_manager.command())?;
 
         let mut cmd = Command::new(package_manager_binary);
         let mut args = vec!["run".to_string(), self.task_id.task().to_string()];
@@ -779,9 +905,7 @@ impl ExecContext {
             args.extend(pass_through_args.iter().cloned());
         }
         cmd.args(args);
-        cmd.current_dir(self.workspace_directory.as_path());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
+        cmd.current_dir(self.workspace_directory.clone());
 
         // We clear the env before populating it with variables we expect
         cmd.env_clear();
@@ -789,49 +913,72 @@ impl ExecContext {
         // Always last to make sure it overwrites any user configured env var.
         cmd.env("TURBO_HASH", &self.task_hash);
 
-        let mut stdout_writer = match self
-            .task_cache
-            .output_writer(self.pretty_prefix.clone(), output_client.stdout())
-        {
-            Ok(w) => w,
-            Err(e) => {
-                telemetry.track_error(TrackedErrors::FailedToCaptureOutputs);
-                error!("failed to capture outputs for \"{}\": {e}", self.task_id);
-                return ExecOutcome::Internal;
-            }
-        };
+        // Allow downstream tools to detect if the task is being ran with TUI
+        if self.experimental_ui {
+            cmd.env("TURBO_IS_TUI", "true");
+        }
+
+        // enable task access tracing
+
+        // set the trace file env var - frameworks that support this can use it to
+        // write out a trace file that we will use to automatically cache the task
+        if self.task_access.is_enabled() {
+            let (task_access_trace_key, trace_file) = self.task_access.get_env_var(&self.task_hash);
+            cmd.env(task_access_trace_key, trace_file.to_string());
+        }
+
+        cmd.open_stdin();
 
         let mut process = match self.manager.spawn(cmd, Duration::from_millis(500)) {
             Some(Ok(child)) => child,
             // Turbo was unable to spawn a process
             Some(Err(e)) => {
                 // Note: we actually failed to spawn, but this matches the Go output
-                prefixed_ui.error(format!("command finished with error: {e}"));
+                prefixed_ui.error(&format!("command finished with error: {e}"));
                 let error_string = e.to_string();
                 self.errors
                     .lock()
                     .expect("lock poisoned")
                     .push(TaskError::from_spawn(self.task_id_for_display.clone(), e));
-                return ExecOutcome::Task {
+                return Ok(ExecOutcome::Task {
                     exit_code: None,
                     message: error_string,
-                };
+                });
             }
             // Turbo is shutting down
             None => {
-                return ExecOutcome::Internal;
+                return Ok(ExecOutcome::Shutdown);
             }
         };
 
-        let exit_status = match process
-            .wait_with_piped_outputs(&mut stdout_writer, None)
-            .await
-        {
+        if self.experimental_ui && self.takes_input {
+            if let TaskOutput::UI(task) = output_client {
+                if let Some(stdin) = process.stdin() {
+                    task.set_stdin(stdin);
+                }
+            }
+        }
+
+        // Even if user does not have the TUI and cannot interact with a task, we keep
+        // stdin open for persistent tasks as some programs will shut down if stdin is
+        // closed.
+        if !self.takes_input && !self.manager.closing_stdin_ends_process() {
+            process.stdin();
+        }
+
+        let mut stdout_writer = self
+            .task_cache
+            .output_writer(prefixed_ui.task_writer())
+            .map_err(|e| {
+                telemetry.track_error(TrackedErrors::FailedToCaptureOutputs);
+                e
+            })?;
+
+        let exit_status = match process.wait_with_piped_outputs(&mut stdout_writer).await {
             Ok(Some(exit_status)) => exit_status,
             Err(e) => {
                 telemetry.track_error(TrackedErrors::FailedToPipeOutputs);
-                error!("unable to pipe outputs from command: {e}");
-                return ExecOutcome::Internal;
+                return Err(e.into());
             }
             Ok(None) => {
                 // TODO: how can this happen? we only update the
@@ -839,29 +986,35 @@ impl ExecContext {
                 // None. Is it still running?
                 telemetry.track_error(TrackedErrors::UnknownChildExit);
                 error!("unable to determine why child exited");
-                return ExecOutcome::Internal;
+                return Err(InternalError::UnknownChildExit);
             }
         };
         let task_duration = task_start.elapsed();
 
         match exit_status {
             ChildExit::Finished(Some(0)) => {
+                // Attempt to flush stdout_writer and log any errors encountered
                 if let Err(e) = stdout_writer.flush() {
                     error!("{e}");
-                } else if let Err(e) = self
-                    .task_cache
-                    .save_outputs(&mut prefixed_ui, task_duration, telemetry)
-                    .await
+                } else if self
+                    .task_access
+                    .can_cache(&self.task_hash, &self.task_id_for_display)
+                    .unwrap_or(true)
                 {
-                    error!("error caching output: {e}");
-                } else {
-                    self.hash_tracker.insert_expanded_outputs(
-                        self.task_id.clone(),
-                        self.task_cache.expanded_outputs().to_vec(),
-                    );
+                    if let Err(e) = self.task_cache.save_outputs(task_duration, telemetry).await {
+                        error!("error caching output: {e}");
+                        return Err(e.into());
+                    } else {
+                        // If no errors, update hash tracker with expanded outputs
+                        self.hash_tracker.insert_expanded_outputs(
+                            self.task_id.clone(),
+                            self.task_cache.expanded_outputs().to_vec(),
+                        );
+                    }
                 }
 
-                ExecOutcome::Success(SuccessOutcome::Run)
+                // Return success outcome
+                Ok(ExecOutcome::Success(SuccessOutcome::Run))
             }
             ChildExit::Finished(Some(code)) => {
                 // If there was an error, flush the buffered output
@@ -876,22 +1029,24 @@ impl ExecContext {
                 if self.continue_on_error {
                     prefixed_ui.warn("command finished with error, but continuing...");
                 } else {
-                    prefixed_ui.error(format!("command finished with error: {error}"));
+                    prefixed_ui.error(&format!("command finished with error: {error}"));
                 }
                 self.errors.lock().expect("lock poisoned").push(TaskError {
                     task_id: self.task_id_for_display.clone(),
                     cause: error,
                 });
-                ExecOutcome::Task {
+                Ok(ExecOutcome::Task {
                     exit_code: Some(code),
                     message,
-                }
+                })
             }
-            // All of these indicate a failure where we don't know how to recover
-            ChildExit::Finished(None)
-            | ChildExit::Killed
-            | ChildExit::KilledExternal
-            | ChildExit::Failed => ExecOutcome::Internal,
+            // The child exited in a way where we can't figure out how it finished so we assume it
+            // failed.
+            ChildExit::Finished(None) | ChildExit::Failed => Err(InternalError::UnknownChildExit),
+            // Something else killed the child
+            ChildExit::KilledExternal => Err(InternalError::ExternalKill),
+            // The child was killed by turbo indicating a shutdown
+            ChildExit::Killed => Ok(ExecOutcome::Shutdown),
         }
     }
 
@@ -923,12 +1078,97 @@ struct DryRunExecContext {
 }
 
 impl DryRunExecContext {
-    pub async fn execute_dry_run(&self, tracker: TaskTracker<()>) {
+    pub async fn execute_dry_run(&self, tracker: TaskTracker<()>) -> Result<(), InternalError> {
         // may also need to do framework & command stuff?
         if let Ok(Some(status)) = self.task_cache.exists().await {
             self.hash_tracker
                 .insert_cache_status(self.task_id.clone(), status);
         }
         tracker.dry_run().await;
+        Ok(())
+    }
+}
+
+/// Struct for displaying information about task's cache
+enum TaskCacheOutput<W> {
+    Direct(PrefixedUI<W>),
+    UI(TuiTask),
+}
+
+impl<W: Write> TaskCacheOutput<W> {
+    fn task_writer(&mut self) -> Either<turborepo_ui::PrefixedWriter<&mut W>, TuiTask> {
+        match self {
+            TaskCacheOutput::Direct(prefixed) => Either::Left(prefixed.output_prefixed_writer()),
+            TaskCacheOutput::UI(task) => Either::Right(task.clone()),
+        }
+    }
+
+    fn warn(&mut self, message: impl std::fmt::Display) {
+        match self {
+            TaskCacheOutput::Direct(prefixed) => prefixed.warn(message),
+            TaskCacheOutput::UI(task) => {
+                let _ = write!(task, "\r\n{message}\r\n");
+            }
+        }
+    }
+}
+
+impl<W: Write> CacheOutput for TaskCacheOutput<W> {
+    fn status(&mut self, message: &str, result: CacheResult) {
+        match self {
+            TaskCacheOutput::Direct(direct) => direct.output(message),
+            TaskCacheOutput::UI(task) => task.status(message, result),
+        }
+    }
+
+    fn error(&mut self, message: &str) {
+        match self {
+            TaskCacheOutput::Direct(prefixed) => prefixed.error(message),
+            TaskCacheOutput::UI(task) => {
+                let _ = write!(task, "{message}\r\n");
+            }
+        }
+    }
+
+    fn replay_logs(&mut self, log_file: &AbsoluteSystemPath) -> Result<(), turborepo_ui::Error> {
+        match self {
+            TaskCacheOutput::Direct(direct) => {
+                let writer = direct.output_prefixed_writer();
+                turborepo_ui::replay_logs(writer, log_file)
+            }
+            TaskCacheOutput::UI(task) => turborepo_ui::replay_logs(task, log_file),
+        }
+    }
+}
+
+/// Struct for displaying information about task
+impl<W: Write> TaskOutput<W> {
+    pub fn finish(self, use_error: bool, is_cache_hit: bool) -> std::io::Result<Option<Vec<u8>>> {
+        match self {
+            TaskOutput::Direct(client) => client.finish(use_error),
+            TaskOutput::UI(client) if use_error => Ok(Some(client.failed())),
+            TaskOutput::UI(client) => Ok(Some(client.succeeded(is_cache_hit))),
+        }
+    }
+
+    pub fn stdout(&self) -> Either<OutputWriter<W>, TuiTask> {
+        match self {
+            TaskOutput::Direct(client) => Either::Left(client.stdout()),
+            TaskOutput::UI(client) => Either::Right(client.clone()),
+        }
+    }
+
+    pub fn stderr(&self) -> Either<OutputWriter<W>, TuiTask> {
+        match self {
+            TaskOutput::Direct(client) => Either::Left(client.stderr()),
+            TaskOutput::UI(client) => Either::Right(client.clone()),
+        }
+    }
+
+    pub fn task_logs(&self) -> Either<OutputWriter<W>, TuiTask> {
+        match self {
+            TaskOutput::Direct(client) => Either::Left(client.stdout()),
+            TaskOutput::UI(client) => Either::Right(client.clone()),
+        }
     }
 }
